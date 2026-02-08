@@ -19,27 +19,27 @@ fbi_fast(
 )
 }
 \arguments{
-\item{DT}{A data.table containing the panel data.}
+\item{DT}{A data.table.}
 
-\item{vars}{Character vector of variable names to impute.}
+\item{vars}{Character vector.}
 
-\item{id_var}{Character string of the ID variable name.}
+\item{id_var}{Character string.}
 
-\item{time_var}{Character string of the time variable name.}
+\item{time_var}{Character string.}
 
-\item{rank}{Integer. Number of factors (k) to estimate.}
+\item{rank}{Integer.}
 
-\item{thresh}{Numeric. Convergence threshold for EM algorithm.}
+\item{thresh}{Numeric.}
 
-\item{max_iter}{Integer. Max iterations for EM.}
+\item{max_iter}{Integer.}
 
-\item{out_suff}{Character string or NULL. Suffix for new columns.}
+\item{out_suff}{Character string or NULL.}
 
-\item{max_hole}{Integer or Inf. Max length of internal NA gap to fill.}
+\item{max_hole}{Integer or Inf.}
 
-\item{max_endpoint}{Integer or Inf. Max distance from data to fill at endpoints.}
+\item{max_endpoint}{Integer or Inf.}
 
-\item{verbose}{Logical. Print progress.}
+\item{verbose}{Logical.}
 }
 \description{
 Imputes missing values using an EM-SVD (Factor) approach, similar to Bai & Ng (2019),

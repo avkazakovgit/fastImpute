@@ -228,6 +228,26 @@ kalman_fast <- function(
 #' @import data.table
 #' @importFrom bit64 as.integer64
 #' @export
+#' Fast Factor-Based Imputation
+#'
+#' Imputes missing values using an EM-SVD approach with Double Centering
+#' (Unit Standardization + Time Centering).
+#'
+#' @param DT A data.table.
+#' @param vars Character vector.
+#' @param id_var Character string.
+#' @param time_var Character string.
+#' @param rank Integer.
+#' @param thresh Numeric.
+#' @param max_iter Integer.
+#' @param out_suff Character string or NULL.
+#' @param max_hole Integer or Inf.
+#' @param max_endpoint Integer or Inf.
+#' @param verbose Logical.
+#'
+#' @import data.table
+#' @importFrom bit64 as.integer64
+#' @export
 fbi_fast <- function(
     DT,
     vars,
@@ -304,16 +324,34 @@ fbi_fast <- function(
       next
     }
 
-    # --- STEP B: EM-SVD ---
-    mu <- rowMeans(X, na.rm = TRUE)
-    mu[is.na(mu)] <- 0
-    X_cent <- X - mu
+    # --- STEP B: PRE-PROCESSING (Double Centering) ---
 
+    # 1. Standardize Units (Columns): Remove Unit FE and Scale Variance
+    # This prevents "Big Firms" or "Volatile Firms" from hijacking the factors
+    mu_unit <- colMeans(X, na.rm = TRUE)
+    sd_unit <- apply(X, 2, sd, na.rm = TRUE)
+
+    # Handle flat constant columns (sd=0 or NA)
+    sd_unit[is.na(sd_unit) | sd_unit < 1e-8] <- 1
+    mu_unit[is.na(mu_unit)] <- 0
+
+    # Z-Score the matrix (Broadcasting in R is Column-wise by default for - but needs transpose for /)
+    # Efficient calculation: (X - Mean) / SD
+    X_std <- t((t(X) - mu_unit) / sd_unit)
+
+    # 2. Center Time (Rows): Remove Global Macro Trends
+    # FBI will now find factors that explain deviations from the global trend
+    mu_time <- rowMeans(X_std, na.rm = TRUE)
+    mu_time[is.na(mu_time)] <- 0
+
+    X_cent <- X_std - mu_time
+
+    # --- STEP C: EM-SVD ALGORITHM ---
     na_idx <- which(is.na(X_cent))
 
     if (length(na_idx) > 0) {
       X_filled <- X_cent
-      X_filled[na_idx] <- 0
+      X_filled[na_idx] <- 0 # Initial guess: 0 (Average)
 
       for (iter in 1:max_iter) {
         svd_fit <- try(svd(X_filled, nu = curr_rank, nv = curr_rank), silent=TRUE)
@@ -329,12 +367,19 @@ fbi_fast <- function(
         rss <- sum((curr_vals - new_vals)^2) / (sum(curr_vals^2) + 1e-10)
         if (rss < thresh) break
       }
-      X_final <- X_filled + mu
+
+      # --- STEP D: REVERSE TRANSFORMS ---
+      # 1. Add back Time Means
+      X_final_std <- X_filled + mu_time
+
+      # 2. Un-Standardize Units (Restore Scale and Unit FE)
+      X_final <- t(t(X_final_std) * sd_unit + mu_unit)
+
     } else {
       X_final <- X
     }
 
-    # --- STEP C: Reconstruct ---
+    # --- STEP E: Reconstruct ---
     res_wide <- as.data.table(X_final)
     res_wide[, (time_var) := time_index]
 
@@ -346,7 +391,6 @@ fbi_fast <- function(
     # Robust ID Restoration
     target_class <- class(DT[[id_var]])[1]
     if ("integer64" %in% class(DT[[id_var]])) {
-      # require(bit64) - handled by importFrom
       res_long[, (id_var) := bit64::as.integer64(as.character(get(id_var)))]
     } else if (is.numeric(DT[[id_var]])) {
       res_long[, (id_var) := as.numeric(as.character(get(id_var)))]
