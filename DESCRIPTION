@@ -17,3 +17,5 @@ Imports:
     ggplot2,
     KFAS,
     Rcpp
+URL: https://github.com/avkazakovgit/fastImpute
+BugReports: https://github.com/avkazakovgit/fastImpute/issues
