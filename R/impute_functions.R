@@ -208,45 +208,12 @@ kalman_fast <- function(
 }
 
 
-#' Fast Factor-Based Imputation
+#' Fast Factor-Based Imputation (Robust)
 #'
-#' Imputes missing values using an EM-SVD (Factor) approach, similar to Bai & Ng (2019),
-#' optimized for large panels.
+#' Imputes missing values using an EM-SVD approach.
+#' Automatically applies log/asinh transformation and Double Centering (Median-based)
+#' to prevent outliers from corrupting the imputation.
 #'
-#' @param DT A data.table containing the panel data.
-#' @param vars Character vector of variable names to impute.
-#' @param id_var Character string of the ID variable name.
-#' @param time_var Character string of the time variable name.
-#' @param rank Integer. Number of factors (k) to estimate.
-#' @param thresh Numeric. Convergence threshold for EM algorithm.
-#' @param max_iter Integer. Max iterations for EM.
-#' @param out_suff Character string or NULL. Suffix for new columns.
-#' @param max_hole Integer or Inf. Max length of internal NA gap to fill.
-#' @param max_endpoint Integer or Inf. Max distance from data to fill at endpoints.
-#' @param verbose Logical. Print progress.
-#'
-#' @import data.table
-#' @importFrom bit64 as.integer64
-#' @export
-#' Fast Factor-Based Imputation
-#'
-#' Imputes missing values using an EM-SVD approach with Double Centering
-#' (Unit Standardization + Time Centering).
-#'
-#' @param DT A data.table.
-#' @param vars Character vector.
-#' @param id_var Character string.
-#' @param time_var Character string.
-#' @param rank Integer.
-#' @param thresh Numeric.
-#' @param max_iter Integer.
-#' @param out_suff Character string or NULL.
-#' @param max_hole Integer or Inf.
-#' @param max_endpoint Integer or Inf.
-#' @param verbose Logical.
-#'
-#' @import data.table
-#' @importFrom bit64 as.integer64
 #' @export
 fbi_fast <- function(
     DT,
@@ -256,51 +223,35 @@ fbi_fast <- function(
     rank = 4L,
     thresh = 1e-5,
     max_iter = 20L,
-    out_suff = "_fbi",      # NULL = Overwrite, String = New Cols
-    max_hole = Inf,         # Max length of internal NA gap to fill
-    max_endpoint = Inf,     # Max distance from data to fill at starts/ends
+    out_suff = "_fbi",      # NULL = Overwrite
+    max_hole = Inf,
+    max_endpoint = Inf,
     verbose = TRUE
 ) {
-  if (!data.table::is.data.table(DT)) {
-    DT <- data.table::as.data.table(DT)
-  }
-
+  if (!data.table::is.data.table(DT)) DT <- data.table::as.data.table(DT)
   data.table::setorderv(DT, c(id_var, time_var))
 
   # --- Helper: Mask Calculation ---
   calc_fill_mask <- function(x, mh, me) {
     is_na <- is.na(x)
     if (!any(is_na)) return(rep(FALSE, length(x)))
-
     n <- length(x)
     idx_obs <- which(!is_na)
     if (length(idx_obs) == 0) return(rep(FALSE, n))
-
-    first_obs <- idx_obs[1]
-    last_obs  <- idx_obs[length(idx_obs)]
+    first_obs <- idx_obs[1]; last_obs <- idx_obs[length(idx_obs)]
     mask <- rep(FALSE, n)
-
     if (first_obs < last_obs - 1) {
       r <- rle(is_na)
-      ok_runs <- r$values & (r$lengths <= mh)
-      internal_mask <- rep(ok_runs, r$lengths)
-      if (first_obs > 1) internal_mask[1:(first_obs-1)] <- FALSE
-      if (last_obs < n)  internal_mask[(last_obs+1):n]  <- FALSE
-      mask <- mask | internal_mask
+      mask <- mask | rep(r$values & (r$lengths <= mh), r$lengths)
+      if (first_obs > 1) mask[1:(first_obs-1)] <- FALSE
+      if (last_obs < n)  mask[(last_obs+1):n]  <- FALSE
     }
-
     if (is.infinite(me)) {
       if (first_obs > 1) mask[1:(first_obs-1)] <- TRUE
       if (last_obs < n)  mask[(last_obs+1):n]  <- TRUE
     } else if (me > 0) {
-      if (first_obs > 1) {
-        start <- max(1, first_obs - me)
-        mask[start:(first_obs-1)] <- TRUE
-      }
-      if (last_obs < n) {
-        end <- min(n, last_obs + me)
-        mask[(last_obs+1):end] <- TRUE
-      }
+      if (first_obs > 1) mask[max(1, first_obs - me):(first_obs-1)] <- TRUE
+      if (last_obs < n)  mask[(last_obs+1):min(n, last_obs + me)] <- TRUE
     }
     return(mask)
   }
@@ -308,9 +259,20 @@ fbi_fast <- function(
   for (v in vars) {
     if (verbose) message(sprintf("Processing '%s' (Rank: %d)...", v, rank))
 
+    # --- STEP 0: CHECK & TRANSFORM ---
+    raw_vals_global <- as.numeric(DT[[v]])
+    min_val  <- min(raw_vals_global, na.rm = TRUE)
+    use_log <- (min_val > 0)
+
+    if (use_log) {
+      DT[, temp_v_trans := log(as.numeric(get(v)))]
+    } else {
+      DT[, temp_v_trans := asinh(as.numeric(get(v)))]
+    }
+
     # --- STEP A: Pivot ---
     form <- as.formula(paste(time_var, "~", id_var))
-    wide_dt <- data.table::dcast(DT, form, value.var = v)
+    wide_dt <- data.table::dcast(DT, form, value.var = "temp_v_trans")
 
     time_index <- wide_dt[[time_var]]
     X <- as.matrix(wide_dt[, -1])
@@ -320,30 +282,22 @@ fbi_fast <- function(
     curr_rank <- min(rank, T_dim - 1, N_dim - 1)
 
     if (curr_rank < 1) {
+      DT[, temp_v_trans := NULL]
       if(verbose) message("  -> Skipped: Dimensions too small.")
       next
     }
 
     # --- STEP B: PRE-PROCESSING (Double Centering) ---
-
-    # 1. Standardize Units (Columns): Remove Unit FE and Scale Variance
-    # This prevents "Big Firms" or "Volatile Firms" from hijacking the factors
     mu_unit <- colMeans(X, na.rm = TRUE)
     sd_unit <- apply(X, 2, sd, na.rm = TRUE)
-
-    # Handle flat constant columns (sd=0 or NA)
     sd_unit[is.na(sd_unit) | sd_unit < 1e-8] <- 1
     mu_unit[is.na(mu_unit)] <- 0
 
-    # Z-Score the matrix (Broadcasting in R is Column-wise by default for - but needs transpose for /)
-    # Efficient calculation: (X - Mean) / SD
     X_std <- t((t(X) - mu_unit) / sd_unit)
 
-    # 2. Center Time (Rows): Remove Global Macro Trends
-    # FBI will now find factors that explain deviations from the global trend
-    mu_time <- rowMeans(X_std, na.rm = TRUE)
+    # Use MEDIAN for time centering to kill outliers
+    mu_time <- apply(X_std, 1, median, na.rm = TRUE)
     mu_time[is.na(mu_time)] <- 0
-
     X_cent <- X_std - mu_time
 
     # --- STEP C: EM-SVD ALGORITHM ---
@@ -351,7 +305,7 @@ fbi_fast <- function(
 
     if (length(na_idx) > 0) {
       X_filled <- X_cent
-      X_filled[na_idx] <- 0 # Initial guess: 0 (Average)
+      X_filled[na_idx] <- 0
 
       for (iter in 1:max_iter) {
         svd_fit <- try(svd(X_filled, nu = curr_rank, nv = curr_rank), silent=TRUE)
@@ -368,18 +322,21 @@ fbi_fast <- function(
         if (rss < thresh) break
       }
 
-      # --- STEP D: REVERSE TRANSFORMS ---
-      # 1. Add back Time Means
       X_final_std <- X_filled + mu_time
-
-      # 2. Un-Standardize Units (Restore Scale and Unit FE)
       X_final <- t(t(X_final_std) * sd_unit + mu_unit)
 
     } else {
       X_final <- X
     }
 
-    # --- STEP E: Reconstruct ---
+    # --- STEP E: REVERSE TRANSFORMATION ---
+    if (use_log) {
+      X_final <- exp(X_final)
+    } else {
+      X_final <- sinh(X_final)
+    }
+
+    # --- STEP F: Reconstruct ---
     res_wide <- as.data.table(X_final)
     res_wide[, (time_var) := time_index]
 
@@ -388,7 +345,7 @@ fbi_fast <- function(
       variable.factor = FALSE
     )
 
-    # Robust ID Restoration
+    # ID Restoration
     target_class <- class(DT[[id_var]])[1]
     if ("integer64" %in% class(DT[[id_var]])) {
       res_long[, (id_var) := bit64::as.integer64(as.character(get(id_var)))]
@@ -398,21 +355,18 @@ fbi_fast <- function(
       res_long[, (id_var) := as.character(get(id_var))]
     }
 
-    # Use a keyed join to ensure we don't create or lose rows
     data.table::setkeyv(res_long, c(id_var, time_var))
     data.table::setkeyv(DT, c(id_var, time_var))
 
     DT[res_long, temp_imp := i.imp_val]
 
-    # --- NEW: APPLY HOLE/ENDPOINT FILTER ---
+    # --- FIXED: Use get(v) inside the group-by operation ---
     if (!is.infinite(max_hole) || !is.infinite(max_endpoint)) {
       DT[, temp_mask := calc_fill_mask(get(v), max_hole, max_endpoint), by = c(id_var)]
-      # Only mask the IMPUTED values, leave original data untouched
       DT[temp_mask == FALSE, temp_imp := NA]
       DT[, temp_mask := NULL]
     }
 
-    # Merge/Overwrite
     if (is.null(out_suff)) {
       DT[, (v) := data.table::fcoalesce(as.numeric(get(v)), temp_imp)]
     } else {
@@ -420,7 +374,7 @@ fbi_fast <- function(
       DT[, (out_col) := data.table::fcoalesce(as.numeric(get(v)), temp_imp)]
     }
 
-    DT[, temp_imp := NULL]
+    DT[, c("temp_imp", "temp_v_trans") := NULL]
     rm(wide_dt, X, X_cent, X_filled, res_wide, res_long, time_index)
     gc()
   }
