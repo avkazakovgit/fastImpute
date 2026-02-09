@@ -474,64 +474,46 @@ impute_hybrid <- function(
 #' @import data.table
 #' @import ggplot2
 #' @export
-validate_imputation <- function(
-    DT,
-    vars,
-    id_var,
-    time_var,
-    impute_fn,
-    mask_rate = 0.2,
-    seed = 123,
-    plot_worst_n = 4,
-    ... # Arguments passed to impute_fn (e.g., degree, overwrite, k)
-) {
-  set.seed(seed)
+validate_imputation <- function(DT,
+                                vars,
+                                id_var,
+                                time_var,
+                                impute_fn,
+                                mask_rate = 0.2,
+                                seed = 123,
+                                plot_worst_n = 4,
+                                ...) {
 
+  set.seed(seed)
   message("--- Starting Validation Protocol ---")
 
-  # 1. Setup Data & Copy
   if (!data.table::is.data.table(DT)) DT <- data.table::as.data.table(DT)
-  DT_test <- data.table::copy(DT)
 
-  # 2. Masking Phase (The "Fire Drill")
+  # 1. Create Testing Set
+  DT_test <- data.table::copy(DT)
   mask_map <- list()
 
   for (v in vars) {
-    # a. Back up the Ground Truth
     truth_col <- paste0("truth_", v)
     DT_test[, (truth_col) := get(v)]
 
-    # b. Find valid data points
+    # Identify valid indices to drop
     valid_idxs <- DT_test[which(!is.na(get(v))), .I]
-
-    # c. Decide what to delete
     n_drop <- floor(length(valid_idxs) * mask_rate)
 
     if (n_drop > 0) {
       drop_idx <- sample(valid_idxs, n_drop)
       mask_map[[v]] <- drop_idx
-
-      # d. DESTROY DATA (Set to NA)
       DT_test[drop_idx, (v) := NA]
     }
   }
 
   message(sprintf("Masking complete (%.0f%%). Executing Imputation Strategy...", mask_rate * 100))
 
-  # 3. Execution Phase
+  # 2. Run Imputation
   start_time <- Sys.time()
+  DT_imputed <- impute_fn(DT = DT_test, vars = vars, id_var = id_var, time_var = time_var, ...)
 
-  # CRITICAL: The user must pass args that force the function to return
-  # the filled data in the SAME columns (e.g., out_suff=NULL).
-  DT_imputed <- impute_fn(
-    DT = DT_test,
-    vars = vars,
-    id_var = id_var,
-    time_var = time_var,
-    ...
-  )
-
-  # Safety Check: Did we get a data.table back?
   if (!data.table::is.data.table(DT_imputed)) {
     stop("The 'impute_fn' must return a data.table object.")
   }
@@ -539,24 +521,19 @@ validate_imputation <- function(
   duration <- round(difftime(Sys.time(), start_time, units = "secs"), 2)
   message(sprintf("Imputation finished in %s seconds.", duration))
 
-  # 4. Grading Phase
+  # 3. Calculate Stats
   results_list <- list()
 
   for (v in vars) {
     idx <- mask_map[[v]]
-
-    # Skip if nothing was masked
     if (length(idx) == 0) next
 
-    # Retrieve vectors
-    vec_truth   <- DT_test[idx, get(paste0("truth_", v))]
+    vec_truth <- DT_test[idx, get(paste0("truth_", v))]
     vec_imputed <- DT_imputed[idx, get(v)]
 
-    # --- SANITY CHECK: Did imputation actually happen? ---
-    n_still_na <- sum(is.na(vec_imputed))
-    if (n_still_na == length(idx)) {
-      warning(paste0("Variable '", v, "' returned ALL NAs. Did you forget out_suff=NULL?"))
-
+    # Check for complete failure (All NAs)
+    if (all(is.na(vec_imputed))) {
+      warning(paste0("Variable '", v, "' returned ALL NAs."))
       results_list[[v]] <- data.table(
         Variable = v, RMSE = NA, MAE = NA, NRMSE_Pct = NA,
         Status = "FAILED (All NAs)", Error_Type = "Check Args"
@@ -564,49 +541,52 @@ validate_imputation <- function(
       next
     }
 
-    # Calculate Differences
     diffs <- vec_truth - vec_imputed
 
-    # Robust Metrics (Handle NaNs)
-    rmse  <- sqrt(mean(diffs^2, na.rm=TRUE))
-    mae   <- mean(abs(diffs), na.rm=TRUE)
+    # Robust Stats Calculation
+    rmse <- sqrt(mean(diffs^2, na.rm = TRUE))
+    mae <- mean(abs(diffs), na.rm = TRUE)
+    range_val <- max(vec_truth, na.rm = TRUE) - min(vec_truth, na.rm = TRUE)
 
-    range_val <- max(vec_truth, na.rm=T) - min(vec_truth, na.rm=T)
+    nrmse_pct <- if (!is.na(range_val) && range_val > 0) (rmse / range_val) * 100 else NA
 
-    # NRMSE (Normalized Error %)
-    nrmse_pct <- if(!is.na(range_val) && range_val > 0) (rmse / range_val) * 100 else NA
-
-    # Assign Status Flags
+    # Status Logic
     status <- "Good"
     if (!is.na(nrmse_pct)) {
       if (nrmse_pct > 20) status <- "CRITICAL"
       else if (nrmse_pct > 10) status <- "Check"
     }
 
-    # Check Shape (Spikes vs Consistent Bias)
+    # Shape Logic (Robust Fix Here)
     shape_flag <- "Stable"
-    if (!is.na(mae) && !is.nan(mae) && mae > 0) {
+
+    # FIX: Check is.finite() to catch Inf, and is.na() on the final ratio
+    if (is.finite(mae) && mae > 0 && is.finite(rmse)) {
       ratio <- rmse / mae
-      if (ratio > 2.0) shape_flag <- "Spiky Errors"
+      if (!is.na(ratio) && ratio > 2) {
+        shape_flag <- "Spiky Errors"
+      }
+    } else if (is.infinite(rmse) || is.infinite(mae)) {
+      # Specifically flag divergence
+      shape_flag <- "DIVERGED (Inf)"
+      status <- "CRITICAL"
     }
 
     results_list[[v]] <- data.table(
-      Variable   = v,
-      RMSE       = round(rmse, 4),
-      MAE        = round(mae, 4),
-      NRMSE_Pct  = round(nrmse_pct, 2),
-      Status     = status,
+      Variable = v,
+      RMSE = round(rmse, 4),
+      MAE = round(mae, 4),
+      NRMSE_Pct = round(nrmse_pct, 2),
+      Status = status,
       Error_Type = shape_flag
     )
   }
 
   stats_dt <- rbindlist(results_list)
-  if(nrow(stats_dt) > 0) data.table::setorder(stats_dt, -NRMSE_Pct)
+  if (nrow(stats_dt) > 0) data.table::setorder(stats_dt, -NRMSE_Pct)
 
-  # 5. Visual Diagnostics (Top N Worst)
+  # 4. Generate Diagnostic Plots
   plots_out <- list()
-
-  # Only plot if we have results
   if (nrow(stats_dt) > 0) {
     vars_to_plot <- head(stats_dt$Variable, plot_worst_n)
 
@@ -617,24 +597,22 @@ validate_imputation <- function(
       if (length(affected_ids) > 0) {
         demo_id <- affected_ids[1]
 
-        # Prepare Plot Data (Truth vs Imputed)
+        # Slices
         truth_slice <- DT_test[get(id_var) == demo_id]
         imp_slice   <- DT_imputed[get(id_var) == demo_id]
+        mask_points <- truth_slice[, .I] %in% masked_idxs
 
-        mask_point_indices <- DT_test[get(id_var)==demo_id, .I] %in% mask_map[[v]]
-
+        # Plot
         p <- ggplot() +
-          geom_line(data = truth_slice, aes(x=get(time_var), y=get(paste0("truth_", v))),
+          geom_line(data = truth_slice, aes(x = get(time_var), y = get(paste0("truth_", v))),
                     color = "grey70", size = 0.8, alpha = 0.6) +
-          geom_line(data = imp_slice, aes(x=get(time_var), y=get(v)),
+          geom_line(data = imp_slice, aes(x = get(time_var), y = get(v)),
                     color = "steelblue", size = 0.8) +
-          geom_point(data = truth_slice[mask_point_indices],
-                     aes(x=get(time_var), y=get(paste0("truth_", v))),
+          geom_point(data = truth_slice[mask_points], aes(x = get(time_var), y = get(paste0("truth_", v))),
                      color = "red", size = 3, shape = 4, stroke = 2) +
           labs(
             title = paste0("Diagnostic: ", v, " (ID: ", demo_id, ")"),
-            subtitle = paste0("Method: ", deparse(substitute(impute_fn)), "\nNRMSE: ",
-                              stats_dt[Variable==v, NRMSE_Pct], "% | Status: ", stats_dt[Variable==v, Status]),
+            subtitle = paste0("NRMSE: ", stats_dt[Variable == v, NRMSE_Pct], "% | Status: ", stats_dt[Variable == v, Status]),
             y = "Value", x = "Time"
           ) +
           theme_minimal()
