@@ -412,21 +412,54 @@ impute_hybrid <- function(
   if (!data.table::is.data.table(DT))
     DT <- data.table::as.data.table(DT)
 
-  # =====================================================================
-  # THE FIX: Sort the original DT *before* copying so row orders perfectly align
-  # =====================================================================
+  # 1. Protect against row-scrambling (from our previous fix)
   data.table::setorderv(DT, c(id_var, time_var))
 
-  working_dt <- if (!is.null(out_suff))
-    data.table::copy(DT)
-  else DT
+  # 2. Define the exact masking logic internally
+  calc_fill_mask <- function(x, mh, me) {
+    is_na <- is.na(x)
+    if (!any(is_na)) return(rep(FALSE, length(x)))
+    n <- length(x)
+    idx_obs <- which(!is_na)
+    if (length(idx_obs) == 0) return(rep(FALSE, n))
+
+    first_obs <- idx_obs[1]
+    last_obs <- idx_obs[length(idx_obs)]
+    mask <- rep(FALSE, n)
+
+    if (first_obs < last_obs - 1) {
+      r <- rle(is_na)
+      ok_runs <- r$values & (r$lengths <= mh)
+      internal_mask <- rep(ok_runs, r$lengths)
+      if (first_obs > 1) internal_mask[1:(first_obs - 1)] <- FALSE
+      if (last_obs < n) internal_mask[(last_obs + 1):n] <- FALSE
+      mask <- mask | internal_mask
+    }
+    if (is.infinite(me)) {
+      if (first_obs > 1) mask[1:(first_obs - 1)] <- TRUE
+      if (last_obs < n) mask[(last_obs + 1):n] <- TRUE
+    } else if (me > 0) {
+      if (first_obs > 1) {
+        start <- max(1, first_obs - me)
+        mask[start:(first_obs - 1)] <- TRUE
+      }
+      if (last_obs < n) {
+        end <- min(n, last_obs + me)
+        mask[(last_obs + 1):end] <- TRUE
+      }
+    }
+    return(mask)
+  }
+
+  working_dt <- data.table::copy(DT)
 
   if (verbose)
     message(">>> STEP 1: Running FBI (Market Structure)...")
 
+  # FORCE FBI to impute everything (Inf) so it doesn't double-count limits
   working_dt <- fbi_fast(DT = working_dt, vars = vars, id_var = id_var,
-                         time_var = time_var, rank = fbi_rank, max_hole = max_hole,
-                         max_endpoint = max_endpoint, out_suff = NULL, verbose = verbose)
+                         time_var = time_var, rank = fbi_rank, max_hole = Inf,
+                         max_endpoint = Inf, out_suff = NULL, verbose = verbose)
 
   if (verbose)
     message(">>> STEP 2: Running Kalman on Residual NAs...")
@@ -434,10 +467,29 @@ impute_hybrid <- function(
   vars_with_na <- vars[sapply(working_dt[, ..vars], function(x) any(is.na(x)))]
 
   if (length(vars_with_na) > 0) {
+    # FORCE Kalman to impute everything (Inf)
     working_dt <- kalman_fast(DT = working_dt, vars = vars_with_na,
                               id_var = id_var, time_var = time_var, degree = kalman_degree,
-                              max_hole = max_hole, max_endpoint = max_endpoint,
+                              max_hole = Inf, max_endpoint = Inf,
                               out_suff = NULL, verbose = verbose)
+  }
+
+  if (verbose)
+    message(">>> STEP 3: Enforcing Strict Global Boundaries...")
+
+  # Apply the mask based strictly on the ORIGINAL unmodified data
+  for (v in vars) {
+    orig_col <- paste0("orig_", v)
+    working_dt[, (orig_col) := DT[[v]]]
+
+    # Calculate mask group-by-group using the pure original column
+    working_dt[, temp_mask := calc_fill_mask(get(orig_col), max_hole, max_endpoint), by = id_var]
+
+    # If original is NA and it falls outside the mask, strictly revert to NA
+    working_dt[is.na(get(orig_col)) & temp_mask == FALSE, (v) := NA_real_]
+
+    # Cleanup temp columns
+    working_dt[, c("temp_mask", orig_col) := NULL]
   }
 
   if (!is.null(out_suff)) {
@@ -448,6 +500,7 @@ impute_hybrid <- function(
     }
     return(DT)
   }
+
   return(working_dt)
 
 }
