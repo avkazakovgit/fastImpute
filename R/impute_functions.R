@@ -409,52 +409,47 @@ impute_hybrid <- function(
     out_suff = "_hybrid", # NULL = Overwrite
     verbose = TRUE
 ) {
-  if (!data.table::is.data.table(DT)) DT <- data.table::as.data.table(DT)
+  if (!data.table::is.data.table(DT))
+    DT <- data.table::as.data.table(DT)
 
-  # Create a temporary working copy to avoid messy intermediate overwrites
-  working_dt <- if (!is.null(out_suff)) data.table::copy(DT) else DT
+  # =====================================================================
+  # THE FIX: Sort the original DT *before* copying so row orders perfectly align
+  # =====================================================================
+  data.table::setorderv(DT, c(id_var, time_var))
 
-  # --- STEP 1: FBI (The Heavy Lifter) ---
-  if (verbose) message(">>> STEP 1: Running FBI (Market Structure)...")
+  working_dt <- if (!is.null(out_suff))
+    data.table::copy(DT)
+  else DT
 
-  # We run FBI with out_suff = NULL so it fills the gaps in working_dt
-  working_dt <- fbi_fast(
-    DT = working_dt, vars = vars, id_var = id_var, time_var = time_var,
-    rank = fbi_rank,
-    max_hole = max_hole,
-    max_endpoint = max_endpoint,
-    out_suff = NULL,
-    verbose = verbose
-  )
+  if (verbose)
+    message(">>> STEP 1: Running FBI (Market Structure)...")
 
-  # --- STEP 2: Kalman (The Cleanup Crew) ---
-  if (verbose) message(">>> STEP 2: Running Kalman on Residual NAs...")
+  working_dt <- fbi_fast(DT = working_dt, vars = vars, id_var = id_var,
+                         time_var = time_var, rank = fbi_rank, max_hole = max_hole,
+                         max_endpoint = max_endpoint, out_suff = NULL, verbose = verbose)
 
-  # Only run Kalman on columns that still have NAs
+  if (verbose)
+    message(">>> STEP 2: Running Kalman on Residual NAs...")
+
   vars_with_na <- vars[sapply(working_dt[, ..vars], function(x) any(is.na(x)))]
 
   if (length(vars_with_na) > 0) {
-    working_dt <- kalman_fast(
-      DT = working_dt, vars = vars_with_na, id_var = id_var, time_var = time_var,
-      degree = kalman_degree,
-      max_hole = max_hole,
-      max_endpoint = max_endpoint,
-      out_suff = NULL,
-      verbose = verbose
-    )
+    working_dt <- kalman_fast(DT = working_dt, vars = vars_with_na,
+                              id_var = id_var, time_var = time_var, degree = kalman_degree,
+                              max_hole = max_hole, max_endpoint = max_endpoint,
+                              out_suff = NULL, verbose = verbose)
   }
 
-  # --- STEP 3: Final Column Management ---
   if (!is.null(out_suff)) {
     for (v in vars) {
       new_v <- paste0(v, out_suff)
-      # Transfer the filled column to the ORIGINAL DT
-      DT[, (new_v) := data.table::fcoalesce(as.numeric(get(v)), working_dt[[v]])]
+      DT[, `:=`((new_v), data.table::fcoalesce(as.numeric(get(v)),
+                                               working_dt[[v]]))]
     }
     return(DT)
   }
-
   return(working_dt)
+
 }
 
 #' Validation Protocol
